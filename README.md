@@ -150,3 +150,16 @@ copy_count=0 不动 HBM 检查）。
 payload）。注意：连续模式下每核按 `coreIdx + k×usedCoreNum` 交错取行，单核流是
 跨核交错的，整 die 视角才是全连续覆盖——这正是对照实验想要的（两模式只有地址
 模式不同）。
+
+### 八卡跑 scatter A/B 对照
+
+```bash
+# 先完成 build_c8.sh（只需一次），然后 8 die 并发：
+python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
+  --json-output results/scatter_ab_8die.json
+# 省时版：只测大 copy 档
+python3 run_multidie.py --worker scatter -- --copy-counts 2048 8192 16384 --iters 100
+```
+
+聚合表按 (pattern, copy_count) 输出 8 die 带宽之和，random 与 contiguous 两行直接
+可比；每 die 明细在 `results/multidie_parts/die*.json`。

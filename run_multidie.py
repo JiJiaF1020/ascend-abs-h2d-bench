@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Launch one abs-H2D probe process per die concurrently and merge results.
+"""Launch one H2D probe process per die concurrently and merge results.
 
-Each die runs test_abs_h2d_bandwidth.py in its own process with
+Each die runs the selected worker in its own process with
 ASCEND_RT_VISIBLE_DEVICES pinned to that die, so all dies measure at the
 same time and share host DRAM / PCIe exactly like a real multi-die run.
 Per-die JSON parts plus a merged JSON (with per-config bandwidth sums) are
 written under the results directory.
+
+Workers:
+  abs     test_abs_h2d_bandwidth.py       (grouped by op/dtype/size_mb)
+  scatter test_scatter_contig_vs_random.py (grouped by pattern/copy_count;
+          requires bash build_c8.sh first and uses torch_extension via PYTHONPATH)
 """
 
 from __future__ import annotations
@@ -19,11 +24,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-WORKER = HERE / "test_abs_h2d_bandwidth.py"
+
+WORKERS = {
+    "abs": {
+        "script": HERE / "test_abs_h2d_bandwidth.py",
+        "device_flag": "--devices",
+        "group_keys": ("op", "dtype", "size_mb"),
+    },
+    "scatter": {
+        "script": HERE / "test_scatter_contig_vs_random.py",
+        "device_flag": "--device",
+        "group_keys": ("pattern", "copy_count"),
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worker", choices=tuple(WORKERS), default="abs")
     parser.add_argument("--devices", type=int, nargs="+", default=list(range(8)),
                         help="Physical die indexes; each gets ASCEND_RT_VISIBLE_DEVICES=<idx>.")
     parser.add_argument("--json-output", type=Path, default=Path("results/abs_h2d_multidie.json"))
@@ -40,13 +58,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
+    worker = WORKERS[args.worker]
     args.results_dir.mkdir(parents=True, exist_ok=True)
     jobs = []
     for dev in args.devices:
         part_json = args.results_dir / f"die{dev}.json"
         part_log = args.results_dir / f"die{dev}.log"
-        env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(dev))
-        cmd = [args.python, str(WORKER), "--devices", "npu:0",
+        pythonpath = f"{HERE / 'torch_extension'}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
+        env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(dev), PYTHONPATH=pythonpath)
+        cmd = [args.python, str(worker["script"]), worker["device_flag"], "npu:0",
                "--json-output", str(part_json), *args.extra]
         log_file = part_log.open("w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
@@ -57,7 +77,7 @@ def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
         log_file.close()
         if proc.returncode != 0:
             tail = part_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
-            print(f"A5_ABS_H2D_MULTIDIE_WORKER_FAILED die={dev} returncode={proc.returncode}", flush=True)
+            print(f"A5_H2D_MULTIDIE_WORKER_FAILED die={dev} returncode={proc.returncode}", flush=True)
             print("\n".join(tail), flush=True)
             failures.append(dev)
     if failures:
@@ -66,6 +86,7 @@ def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
 
 
 def merge(args: argparse.Namespace, parts: list[tuple[int, Path, Path]]) -> dict:
+    group_keys = WORKERS[args.worker]["group_keys"]
     rows = []
     environment = None
     worker_config = None
@@ -79,29 +100,31 @@ def merge(args: argparse.Namespace, parts: list[tuple[int, Path, Path]]) -> dict
             row = dict(row)
             row["device"] = f"npu:{dev}"
             rows.append(row)
-    aggregate: dict[tuple[str, str, int], float] = {}
+    aggregate: dict[tuple, float] = {}
     for row in rows:
-        key = (row["op"], row["dtype"], row["size_mb"])
+        key = tuple(row[k] for k in group_keys)
         aggregate[key] = aggregate.get(key, 0.0) + row["bandwidth_gbps"]
     agg_rows = [
-        {"op": op, "dtype": dtype, "size_mb": size, "sum_bandwidth_gbps": total}
-        for (op, dtype, size), total in sorted(aggregate.items(), key=lambda item: (item[0][0], item[0][1], item[0][2]))
+        {**dict(zip(group_keys, key)), "sum_bandwidth_gbps": total}
+        for key, total in sorted(aggregate.items(), key=lambda item: item[0])
     ]
-    abs_agg = [row for row in agg_rows if row["op"] == "abs"]
-    best = max(abs_agg, key=lambda row: row["sum_bandwidth_gbps"])
-    print(f"\n{'op':>12} {'dtype':>5} {'size_mb':>8} {'sum_bw_gbps':>12}", flush=True)
+    best = max(agg_rows, key=lambda row: row["sum_bandwidth_gbps"])
+    header = "".join(f"{k:>12}" for k in group_keys) + f"{'sum_bw_gbps':>14}"
+    print(f"\n{header}", flush=True)
     for row in agg_rows:
-        print(f"{row['op']:>12} {row['dtype']:>5} {row['size_mb']:>8} "
-              f"{row['sum_bandwidth_gbps']:>12.3f}", flush=True)
+        line = "".join(f"{str(row[k]):>12}" for k in group_keys)
+        print(f"{line}{row['sum_bandwidth_gbps']:>14.3f}", flush=True)
+    best_desc = " ".join(f"{k}={best[k]}" for k in group_keys)
     print(
-        f"A5_ABS_H2D_MULTIDIE_MAX_BANDWIDTH dies={len(parts)} dtype={best['dtype']} "
-        f"size_mb={best['size_mb']} sum_bandwidth_gbps={best['sum_bandwidth_gbps']:.3f} ok=1",
+        f"A5_H2D_MULTIDIE_MAX_BANDWIDTH worker={args.worker} dies={len(parts)} "
+        f"{best_desc} sum_bandwidth_gbps={best['sum_bandwidth_gbps']:.3f} ok=1",
         flush=True,
     )
     merged = {
-        "schema_version": 1, "test": "a5_abs_h2d_max_bandwidth_multidie",
+        "schema_version": 2, "test": f"a5_h2d_multidie_{args.worker}",
         "status": "passed", "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "device_count": len(parts), "physical_devices": [dev for dev, _, _ in parts],
+        "worker": args.worker, "group_keys": list(group_keys),
         "environment": environment, "worker_config": worker_config,
         "aggregate": agg_rows,
         "aggregate_max_bandwidth": best,
@@ -110,7 +133,7 @@ def merge(args: argparse.Namespace, parts: list[tuple[int, Path, Path]]) -> dict
     }
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print("A5_ABS_H2D_MULTIDIE_OK", flush=True)
+    print("A5_H2D_MULTIDIE_OK", flush=True)
     return merged
 
 
