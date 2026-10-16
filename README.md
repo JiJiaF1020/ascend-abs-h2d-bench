@@ -1,4 +1,14 @@
-# Ascend 950 abs 全连续 H2D 最大带宽测试
+# Ascend 950 H2D 带宽测试集
+
+两个工具：
+
+1. `test_abs_h2d_bandwidth.py` —— `torch.abs` 全连续 host DRAM→HBM 带宽，外加
+   `copy_` / pinned DMA 基线。**纯 torch_npu，不需要编译**。
+2. `test_scatter_contig_vs_random.py` —— C8 scatter 搬运 kernel 的**离散 vs 连续
+   对照实验**（同一 kernel、同一 656B 行粒度、同一深度 8 MTE 队列，只改地址模式）。
+   **需要先编译自定义算子**（`bash build_c8.sh`）。
+
+## 工具 1：abs / copy / pinned H2D 带宽（免编译）
 
 用 `torch.abs(host_tensor, out=device_tensor)` 实测 **全连续访问**的
 DRAM→HBM（H2D 路径）有效带宽，并扫出最大值。
@@ -108,3 +118,35 @@ NPU Event；swapped-memory 初始化（`fill_`/`add_` staging）不在计时区�
 - 主机内存占用约为每档 2×size（CPU 引用张量 + swapped 张量），8192 MiB 档约 16 GiB，
   注意 host DRAM 余量。
 - 默认全套（3 dtype × 12 size × abs+copy）单 die 大约几分钟，主要花在 CPU 侧随机数初始化。
+
+## 工具 2：scatter 搬运 kernel 离散 vs 连续对照（需编译）
+
+回答的问题：**同一个搬运 kernel，离散访问和连续访问的 H2D 带宽差多少。**
+同一 `kvcache_scatter_copy_c8` kernel（656B 行、深度 8 MTE2 队列、QUEUE_DEPTH=8），
+只把元数据从随机（randperm block table / src / dst）换成连续（恒等 block table、
+顺序 src/dst），其余变量完全一致。
+
+```bash
+# 编译（一次即可；需要 CANN 环境的 msopgen）
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann   # 按实际路径替换
+source "$ASCEND_HOME_PATH/set_env.sh"
+export A5_SOC_VERSION=ascend950 NANOVLLM_A5_OPS_BUILD_JOBS=64
+bash build_c8.sh
+# 通过标准：末尾打印 "[c8_build] torch extension import: OK"
+
+# 运行 A/B 对照（单 die；默认 copy_count 扫 300/2048/8192/16384，bs=24）
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
+python3 test_scatter_contig_vs_random.py \
+  --device npu:0 --json-output results/scatter_ab_npu0.json
+```
+
+输出每个 (pattern, copy_count) 一行 `A5_SCATTER_AB_RESULT`（含逐次迭代统计），
+结尾打印对照表：`copy_count / random_gbps / contig_gbps / contig/random` 比值。
+每个配置计时前后都做全量逐字节校验（poison 填充 + byte-exact 比较 +
+copy_count=0 不动 HBM 检查）。
+
+带宽口径与工具 1 相同：`copied_tokens × 656 / avg_us / 1000`（GB/s，只计一次有效
+payload）。注意：连续模式下每核按 `coreIdx + k×usedCoreNum` 交错取行，单核流是
+跨核交错的，整 die 视角才是全连续覆盖——这正是对照实验想要的（两模式只有地址
+模式不同）。
