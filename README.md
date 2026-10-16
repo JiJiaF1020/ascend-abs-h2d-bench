@@ -56,8 +56,18 @@ python3 test_abs_h2d_bandwidth.py --no-copy-baseline
 - `per_iter_us` / `bandwidth_per_iter_gbps`：min / max / mean / std / p50 / p95。
 - `raw_iter_us`：**每一次迭代的原始耗时**，全部保留在 JSON 里。
 - 环境信息：hostname、python/torch/torch_npu 版本、CANN 路径、`npu-smi info` 原文。
-- copy 基线：`out.copy_(host)` 同口径数据（`op=copy`），用于对比纯 H2D 拷贝路径上限，
-  可用 `--no-copy-baseline` 关掉。
+- copy 基线：`out.copy_(host)` 同口径数据（`op=copy`），用于对比 swapped DRAM 的
+  拷贝路径，可用 `--no-copy-baseline` 关掉。
+- pinned 基线：`pin_memory=True` 锁页内存 → HBM 的 `copy_(non_blocking=True)`
+  （`op=pinned_copy`），走 DMA 拷贝引擎，是**全连续 H2D 的硬件上限探针**，
+  可用 `--no-pinned-baseline` 关掉。三种 op 对比可定位瓶颈：abs（计算 kernel 直读）
+  vs copy（swapped 拷贝路径）vs pinned_copy（DMA 引擎）。
+
+## 单卡与多卡
+
+默认只测 `--devices npu:0` **一个 die**。多 die 顺序扫：`--devices npu:0 npu:1 ...`。
+注意与旧 8 卡图对比口径：旧图 240-260 GB/s 是 8 die 带宽**之和**，单 die 约 30 GB/s，
+和本测试单 die 的数值是同一量级。
 
 `--json-output` 同时生成同目录 `.csv` 汇总表（每配置一行，便于画图）。
 

@@ -5,8 +5,10 @@ Uses torch.abs on a swapped-memory tensor (real host DRAM allocated via
 torch_npu.empty_with_swapped_memory) with the output on HBM, so the device
 kernel reads the whole input over PCIe once per call. Bandwidth counts the
 H2D payload once: input_bytes / avg_us / 1000 (GB/s); the HBM-side output
-write is not counted. An optional `out.copy_(host)` baseline (default on)
-measures the same sizes through the plain H2D copy path for comparison.
+write is not counted. Optional baselines (default on) measure the same sizes
+through the plain H2D copy paths for comparison: `out.copy_(host)` from
+swapped DRAM, and `pinned_copy` (pinned host memory -> HBM, non_blocking),
+which is the DMA-engine ceiling for contiguous H2D.
 
 Pure torch_npu: no custom operator build is required. Per-iteration raw
 timings (NPU events) and wall-clock cross-checks are kept in the JSON.
@@ -29,7 +31,7 @@ from pathlib import Path
 DTYPES = {"fp16": "float16", "bf16": "bfloat16", "fp32": "float32"}
 DEFAULT_SIZES_MB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 SAMPLE_LEN = 1 << 20
-OPS = ("abs", "copy")
+OPS = ("abs", "copy", "pinned_copy")
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copy-baseline", dest="copy_baseline", action="store_true", default=True,
                         help="Also measure out.copy_(host) for the same sizes (default).")
     parser.add_argument("--no-copy-baseline", dest="copy_baseline", action="store_false")
+    parser.add_argument("--pinned-baseline", dest="pinned_baseline", action="store_true", default=True,
+                        help="Also measure pinned-memory -> HBM non_blocking copy, the DMA-engine "
+                             "ceiling for contiguous H2D (default).")
+    parser.add_argument("--no-pinned-baseline", dest="pinned_baseline", action="store_false")
     parser.add_argument("--allow-non-a5", action="store_true", help="Portability debugging only; not A5 validation.")
     parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
@@ -155,22 +161,35 @@ def measure_config(args: argparse.Namespace, device: "torch.device", device_name
     numel = size_mb * (1 << 20) // element_size
     generator = torch.Generator().manual_seed(args.seed)
     cpu = torch.randn(numel, dtype=dtype, generator=generator)
-    host = swapped_from_cpu(cpu, device)
+    if op == "pinned_copy":
+        try:
+            host = torch.empty(numel, dtype=dtype, pin_memory=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "torch.empty(pin_memory=True) failed; this torch/torch_npu build lacks "
+                "pinned host memory support. Report the error back unchanged, or rerun "
+                "with --no-pinned-baseline."
+            ) from exc
+        host.copy_(cpu)
+    else:
+        host = swapped_from_cpu(cpu, device)
     out = torch.empty(numel, dtype=dtype, device=device)
     torch.npu.synchronize()
 
     def call_op() -> None:
         if op == "abs":
             torch.abs(host, out=out)
-        else:
+        elif op == "copy":
             out.copy_(host)
+        else:
+            out.copy_(host, non_blocking=True)
 
     try:
         call_op()
     except Exception as exc:
         raise RuntimeError(
-            f"{op} with swapped-memory input and HBM output failed on device {device}; "
-            "this torch_npu build may not accept swapped-memory operands. "
+            f"{op} with host-resident input and HBM output failed on device {device}; "
+            "this torch_npu build may not accept this host-memory operand. "
             "Report the original error back unchanged."
         ) from exc
     torch.npu.synchronize()
@@ -208,7 +227,7 @@ def measure_config(args: argparse.Namespace, device: "torch.device", device_name
 
 
 def run(args: argparse.Namespace) -> dict:
-    ops = ["abs"] + (["copy"] if args.copy_baseline else [])
+    ops = ["abs"] + (["copy"] if args.copy_baseline else []) + (["pinned_copy"] if args.pinned_baseline else [])
     rows: list[dict] = []
     environment = {
         "hostname": socket.gethostname(), "platform": platform.platform(),
