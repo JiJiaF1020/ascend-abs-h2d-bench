@@ -208,6 +208,8 @@ def check_copy(case: Case) -> None:
         raise AssertionError("C8 scatter must return None (caller-owned HBM).")
     torch.npu.synchronize()
     assert_copied(case)
+    case.hbm.fill_(POISON)
+    torch.npu.synchronize()
     if call_scatter(case, torch.zeros_like(case.copy_counts)) is not None:
         raise AssertionError("Zero-copy scatter must return None.")
     torch.npu.synchronize()
