@@ -65,8 +65,24 @@ python3 test_abs_h2d_bandwidth.py --no-copy-baseline
 
 ## 单卡与多卡
 
-默认只测 `--devices npu:0` **一个 die**。多 die 顺序扫：`--devices npu:0 npu:1 ...`。
-注意与旧 8 卡图对比口径：旧图 240-260 GB/s 是 8 die 带宽**之和**，单 die 约 30 GB/s，
+默认只测 `--devices npu:0` **一个 die**。多 die 有两种测法：
+
+```bash
+# 顺序扫：每个 die 单独测（互不争抢，看单 die 最佳能力）
+python3 test_abs_h2d_bandwidth.py --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 npu:6 npu:7 \
+  --json-output results/abs_h2d_seq8.json
+
+# 并发测 8 卡：每 die 一个进程同时跑（共享 host DRAM/PCIe，与旧 8 卡绑核图同口径）
+python3 run_multidie.py --devices 0 1 2 3 4 5 6 7 \
+  --json-output results/abs_h2d_8die.json
+# 只测大 size 省时：参数放 -- 后面转发给单卡脚本
+python3 run_multidie.py -- --dtypes fp16 --sizes-mb 512 1024 2048 --iters 50
+```
+
+并发版输出每个 (op, dtype, size) 的 8 die 带宽**之和**（`sum_bw_gbps`），可直接和旧图
+240-260 GB/s 对比；每 die 的明细在 `results/multidie_parts/die*.json`，日志在同名 `.log`。
+
+注意与旧 8 卡图对比口径：旧图 240-260 GB/s 是 8 die 带宽之和，单 die 约 30 GB/s，
 和本测试单 die 的数值是同一量级。
 
 `--json-output` 同时生成同目录 `.csv` 汇总表（每配置一行，便于画图）。
