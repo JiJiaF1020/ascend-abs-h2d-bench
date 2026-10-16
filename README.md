@@ -179,3 +179,15 @@ python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
 ```
 
 `--numa-nodes` 的值必须按本机实际拓扑填，上面只是示例。
+
+### 并发方法学（与旧 8 卡测试对齐）
+
+`run_multidie.py` 现在完整复刻旧 8 卡测试的方法学：
+
+1. **逐配置计时屏障**：每个 (pattern/size) 配置，所有 die 的 worker 到齐后由 launcher
+   统一放行，计时窗口严格重叠（日志里 `A5_H2D_MULTIDIE_BARRIER index=N released`），
+   避免初始化/校验耗时不同导致的"假并发"。
+2. **逐 die NUMA 绑核**：`--numa-nodes` 一个节点对应一个 die（见上节）。
+
+不带 `--numa-nodes` 时保持不绑核行为。单 die 直接跑 worker 脚本时屏障参数缺省，
+行为不变。

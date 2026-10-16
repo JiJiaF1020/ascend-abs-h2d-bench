@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true", help="Portability debugging only; not A5 validation.")
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--timing-ready-prefix", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--timing-start-prefix", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -219,12 +221,30 @@ def check_copy(case: Case) -> None:
           "byte_exact=1 zero_count_unchanged=1 ok=1", flush=True)
 
 
-def measure_config(args: argparse.Namespace, device: "torch.device", pattern: str, copy_count: int) -> dict:
+def timing_barrier(args: argparse.Namespace, index: int) -> None:
+    """Rendezvous so all multidie workers time config `index` concurrently."""
+    if args.timing_ready_prefix is None and args.timing_start_prefix is None:
+        return
+    if args.timing_ready_prefix is None or args.timing_start_prefix is None:
+        raise ValueError("timing ready/start prefixes must be specified together")
+    Path(f"{args.timing_ready_prefix}.{index}").write_text("ready\n", encoding="utf-8")
+    start = Path(f"{args.timing_start_prefix}.{index}")
+    deadline = time.monotonic() + 1800
+    print(f"A5_H2D_BARRIER_WAIT index={index}", flush=True)
+    while not start.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for multidie timing barrier {index}")
+        time.sleep(0.001)
+
+
+def measure_config(args: argparse.Namespace, device: "torch.device", pattern: str,
+                   copy_count: int, barrier_index: int) -> dict:
     case = make_case(args, device, pattern, copy_count)
     check_copy(case)
     for _ in range(args.warmup):
         call_scatter(case)
     torch.npu.synchronize()
+    timing_barrier(args, barrier_index)
     events = [torch.npu.Event(enable_timing=True) for _ in range(args.iters + 1)]
     events[0].record()
     wall_start = time.perf_counter()
@@ -268,9 +288,11 @@ def run(args: argparse.Namespace) -> dict:
         flush=True,
     )
     rows = []
+    barrier_index = 0
     for copy_count in args.copy_counts:
         for pattern in ("random", "contiguous"):
-            row = measure_config(args, device, pattern, copy_count)
+            row = measure_config(args, device, pattern, copy_count, barrier_index)
+            barrier_index += 1
             rows.append(row)
             bw = row["bandwidth_per_iter_gbps"]
             print(

@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pinned-baseline", dest="pinned_baseline", action="store_false")
     parser.add_argument("--allow-non-a5", action="store_true", help="Portability debugging only; not A5 validation.")
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--timing-ready-prefix", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--timing-start-prefix", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -154,8 +156,24 @@ def check_samples(cpu: "torch.Tensor", out: "torch.Tensor", op: str, seed: int) 
             raise AssertionError(f"{op} result mismatch at element offset {offset}.")
 
 
+def timing_barrier(args: argparse.Namespace, index: int) -> None:
+    """Rendezvous so all multidie workers time config `index` concurrently."""
+    if args.timing_ready_prefix is None and args.timing_start_prefix is None:
+        return
+    if args.timing_ready_prefix is None or args.timing_start_prefix is None:
+        raise ValueError("timing ready/start prefixes must be specified together")
+    Path(f"{args.timing_ready_prefix}.{index}").write_text("ready\n", encoding="utf-8")
+    start = Path(f"{args.timing_start_prefix}.{index}")
+    deadline = time.monotonic() + 1800
+    print(f"A5_H2D_BARRIER_WAIT index={index}", flush=True)
+    while not start.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for multidie timing barrier {index}")
+        time.sleep(0.001)
+
+
 def measure_config(args: argparse.Namespace, device: "torch.device", device_name: str,
-                   op: str, dtype_name: str, size_mb: int) -> dict:
+                   op: str, dtype_name: str, size_mb: int, barrier_index: int) -> dict:
     dtype = getattr(torch, DTYPES[dtype_name])
     element_size = torch.tensor([], dtype=dtype).element_size()
     numel = size_mb * (1 << 20) // element_size
@@ -198,6 +216,7 @@ def measure_config(args: argparse.Namespace, device: "torch.device", device_name
     for _ in range(args.warmup):
         call_op()
     torch.npu.synchronize()
+    timing_barrier(args, barrier_index)
     events = [torch.npu.Event(enable_timing=True) for _ in range(args.iters + 1)]
     events[0].record()
     wall_start = time.perf_counter()
@@ -237,6 +256,7 @@ def run(args: argparse.Namespace) -> dict:
         "launch_blocking": os.getenv("ASCEND_LAUNCH_BLOCKING", "unset"),
         "npu_smi_info": npu_smi_info(),
     }
+    barrier_index = 0
     for device_str in args.devices:
         device = torch.device(device_str)
         torch.npu.set_device(device)
@@ -252,7 +272,8 @@ def run(args: argparse.Namespace) -> dict:
         for dtype_name in args.dtypes:
             for size_mb in args.sizes_mb:
                 for op in ops:
-                    row = measure_config(args, device, device_name, op, dtype_name, size_mb)
+                    row = measure_config(args, device, device_name, op, dtype_name, size_mb, barrier_index)
+                    barrier_index += 1
                     rows.append(row)
                     bw = row["bandwidth_per_iter_gbps"]
                     print(

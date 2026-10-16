@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +68,9 @@ def parse_args() -> argparse.Namespace:
 def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
     worker = WORKERS[args.worker]
     args.results_dir.mkdir(parents=True, exist_ok=True)
+    sync_dir = args.results_dir / "sync"
+    shutil.rmtree(sync_dir, ignore_errors=True)
+    sync_dir.mkdir()
     jobs = []
     for position, dev in enumerate(args.devices):
         part_json = args.results_dir / f"die{dev}.json"
@@ -73,7 +78,9 @@ def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
         pythonpath = f"{HERE / 'torch_extension'}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
         env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(dev), PYTHONPATH=pythonpath)
         cmd = [args.python, str(worker["script"]), worker["device_flag"], "npu:0",
-               "--json-output", str(part_json), *args.extra]
+               "--json-output", str(part_json),
+               "--timing-ready-prefix", str(sync_dir / f"die{dev}.ready"),
+               "--timing-start-prefix", str(sync_dir / "start"), *args.extra]
         numa_node = None
         if args.numa_nodes is not None:
             numa_node = args.numa_nodes[position]
@@ -83,17 +90,38 @@ def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
         log_file = part_log.open("w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
         jobs.append((dev, proc, part_json, part_log, log_file))
-    failures = []
-    for dev, proc, part_json, part_log, log_file in jobs:
-        proc.wait()
-        log_file.close()
-        if proc.returncode != 0:
-            tail = part_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
-            print(f"A5_H2D_MULTIDIE_WORKER_FAILED die={dev} returncode={proc.returncode}", flush=True)
-            print("\n".join(tail), flush=True)
-            failures.append(dev)
-    if failures:
-        raise SystemExit(f"workers failed on dies {failures}; see {args.results_dir}")
+    # Monitor: release per-config timing barriers once every worker is ready;
+    # abort all workers as soon as any one exits nonzero.
+    remaining = {position: job for position, job in enumerate(jobs)}
+    barrier_index = 0
+    while remaining:
+        failures = []
+        for position in list(remaining):
+            dev, proc, part_json, part_log, log_file = remaining[position]
+            returncode = proc.poll()
+            if returncode is None:
+                continue
+            log_file.close()
+            del remaining[position]
+            if returncode != 0:
+                failures.append((dev, part_log, returncode))
+        if failures:
+            for _, proc, _, _, log_file in remaining.values():
+                proc.kill()
+                log_file.close()
+            for dev, part_log, returncode in failures:
+                tail = part_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+                print(f"A5_H2D_MULTIDIE_WORKER_FAILED die={dev} returncode={returncode}", flush=True)
+                print("\n".join(tail), flush=True)
+            raise SystemExit(f"workers failed on dies {[dev for dev, _, _ in failures]}; "
+                             f"see {args.results_dir}")
+        start_file = sync_dir / f"start.{barrier_index}"
+        if not start_file.exists() and all(
+                (sync_dir / f"die{job[0]}.ready.{barrier_index}").exists() for job in jobs):
+            start_file.write_text("start\n", encoding="utf-8")
+            print(f"A5_H2D_MULTIDIE_BARRIER index={barrier_index} released", flush=True)
+            barrier_index += 1
+        time.sleep(0.005)
     return [(dev, part_json, part_log) for dev, _, part_json, part_log, _ in jobs]
 
 
