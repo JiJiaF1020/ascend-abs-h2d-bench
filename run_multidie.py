@@ -44,6 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", choices=tuple(WORKERS), default="abs")
     parser.add_argument("--devices", type=int, nargs="+", default=list(range(8)),
                         help="Physical die indexes; each gets ASCEND_RT_VISIBLE_DEVICES=<idx>.")
+    parser.add_argument("--numa-nodes", type=int, nargs="+", default=None,
+                        help="One NUMA node id per device, in device order; wraps each worker in "
+                             "numactl --cpunodebind=N --membind=N. Omit to keep unbound behavior.")
     parser.add_argument("--json-output", type=Path, default=Path("results/abs_h2d_multidie.json"))
     parser.add_argument("--results-dir", type=Path, default=Path("results/multidie_parts"))
     parser.add_argument("--python", default=sys.executable)
@@ -54,6 +57,9 @@ def parse_args() -> argparse.Namespace:
         args.extra = args.extra[1:]
     if not args.devices or any(dev < 0 for dev in args.devices):
         parser.error("--devices must be non-negative die indexes")
+    if args.numa_nodes is not None:
+        if len(args.numa_nodes) != len(args.devices) or any(node < 0 for node in args.numa_nodes):
+            parser.error("--numa-nodes must list one non-negative node id per device, in device order")
     return args
 
 
@@ -61,13 +67,19 @@ def launch_workers(args: argparse.Namespace) -> list[tuple[int, Path, Path]]:
     worker = WORKERS[args.worker]
     args.results_dir.mkdir(parents=True, exist_ok=True)
     jobs = []
-    for dev in args.devices:
+    for position, dev in enumerate(args.devices):
         part_json = args.results_dir / f"die{dev}.json"
         part_log = args.results_dir / f"die{dev}.log"
         pythonpath = f"{HERE / 'torch_extension'}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
         env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(dev), PYTHONPATH=pythonpath)
         cmd = [args.python, str(worker["script"]), worker["device_flag"], "npu:0",
                "--json-output", str(part_json), *args.extra]
+        numa_node = None
+        if args.numa_nodes is not None:
+            numa_node = args.numa_nodes[position]
+            cmd = ["numactl", f"--cpunodebind={numa_node}", f"--membind={numa_node}", *cmd]
+        print(f"A5_H2D_MULTIDIE_LAUNCH die={dev} numa_node="
+              f"{numa_node if numa_node is not None else 'unbound'}", flush=True)
         log_file = part_log.open("w", encoding="utf-8")
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
         jobs.append((dev, proc, part_json, part_log, log_file))
@@ -124,6 +136,7 @@ def merge(args: argparse.Namespace, parts: list[tuple[int, Path, Path]]) -> dict
         "schema_version": 2, "test": f"a5_h2d_multidie_{args.worker}",
         "status": "passed", "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "device_count": len(parts), "physical_devices": [dev for dev, _, _ in parts],
+        "numa_nodes": args.numa_nodes,
         "worker": args.worker, "group_keys": list(group_keys),
         "environment": environment, "worker_config": worker_config,
         "aggregate": agg_rows,

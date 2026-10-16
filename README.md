@@ -163,3 +163,19 @@ python3 run_multidie.py --worker scatter -- --copy-counts 2048 8192 16384 --iter
 
 聚合表按 (pattern, copy_count) 输出 8 die 带宽之和，random 与 contiguous 两行直接
 可比；每 die 明细在 `results/multidie_parts/die*.json`。
+
+### NUMA 绑核（8 卡必看）
+
+不绑核时 8 个进程的 swapped DRAM 可能落在同一 NUMA 节点，跨 socket 流量会把聚合带宽
+压低近一半。先查拓扑再绑定（每个 die 一个节点，顺序与 --devices 对应）：
+
+```bash
+lscpu | grep -i numa                    # 看有几个 NUMA 节点
+npu-smi info -t topo -i 0               # 看 NPU 与 NUMA/PCIe 的亲和关系
+
+python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
+  --numa-nodes 0 0 1 1 2 2 3 3 \
+  --json-output results/scatter_ab_8die_numa.json
+```
+
+`--numa-nodes` 的值必须按本机实际拓扑填，上面只是示例。
