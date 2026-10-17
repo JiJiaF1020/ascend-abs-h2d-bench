@@ -1,228 +1,94 @@
-# Ascend 950 H2D 带宽测试集
+# Ascend 950 H2D 带宽基准测试
 
-两个工具：
+host DRAM → HBM 搬运带宽的系统性实测，回答三个问题：
 
-1. `test_abs_h2d_bandwidth.py` —— `torch.abs` 全连续 host DRAM→HBM 带宽，外加
-   `copy_` / pinned DMA 基线。**纯 torch_npu，不需要编译**。
-2. `test_scatter_contig_vs_random.py` —— C8 scatter 搬运 kernel 的**离散 vs 连续
-   对照实验**（同一 kernel、同一 656B 行粒度、同一深度 8 MTE 队列，只改地址模式）。
-   **需要先编译自定义算子**（`bash build_c8.sh`）。
+1. **算子（kernel）路径的搬运极限是多少** —— 算子内由 AI Core 直接读主机内存；
+2. **离散 vs 连续访问差多少** —— 同一搬运 kernel，只改地址模式；
+3. **DMA 引擎 vs kernel 路径差多少** —— pinned memory `copy_` vs 任何 kernel。
 
-## 工具 1：abs / copy / pinned H2D 带宽（免编译）
+测试机：Ascend950DT(9582)，单卡 1 die，整机 16 NPU（CPU0 带 NPU 0-7，CPU1 带 NPU 8-15）。
 
-用 `torch.abs(host_tensor, out=device_tensor)` 实测 **全连续访问**的
-DRAM→HBM（H2D 路径）有效带宽，并扫出最大值。
+## 结论与数据
 
-- **输入**：1D 全连续大张量，`torch_npu.empty_with_swapped_memory` 分配（真实主机 DRAM）。
-- **输出**：同形 HBM 张量（普通 `torch.empty(device=...)`）。
-- **纯 torch_npu 内置算子，不需要编译任何东西**，单文件脚本，无第三方依赖。
+**kernel 路径存在约 22 GB/s/die 的架构性上限，与访问模式、chunk 大小、算子实现无关；
+DMA 引擎路径达 50.4 GB/s/die，是 kernel 路径的 2.3 倍。8 die 并发时每 die 仍卡在
+自身的 22 GB/s 帽上；1:4 拓扑（两 socket 分担）比 1:8（单 socket 带 8 卡）高 18%。**
 
-## 运行方法
+单 die(host DRAM → HBM，大 payload 稳态）:
 
-先找 CANN 路径（三种办法，找到一个即可）：
+| 路径 | 带宽 (GB/s) | 说明 |
+|---|---|---|
+| `torch.abs`(swapped 输入 → HBM 输出) | 22.1 | 通用计算 kernel 直读 host |
+| `VllmA5H2dContigCopy`(本仓自定义算子） | 21~22 | 专用搬运 kernel：16KB DataCopyPad × 深度 4 MTE 队列，全连续 |
+| scatter kernel 离散 vs 连续 | 比值 0.99~1.02 | 同一 kernel 只改地址模式，**无差异** |
+| **`pinned_copy`(pinned memory → HBM `copy_`)** | **50.4** | DMA 拷贝引擎，Gen5 x16 链路真实能力 |
+
+8 die 并发（`VllmA5H2dContigCopy`，合计带宽 GB/s):
+
+| 拓扑 | 1024 MiB | 2048 MiB | 单 die 折算 |
+|---|---|---|---|
+| 1:8(NPU 0-7 全在 CPU0) | 151.9 | 151.9 | ~19.0 |
+| 1:4(两 socket 各 4) | 180.1 | 179.7 | ~22.5 |
+
+解读：单 die 内访问模式无所谓（深度队列隐藏随机性）；整机层面瓶颈是每 die 的
+kernel 路径帽，其次才是单 socket 内存/PCIe 上行的共享争抢（1:8 vs 1:4 差 18%)。
+规划容量时：算子内搬运按 ~22 GB/s/die，主机侧 DMA 预取按 ~50 GB/s/die。
+
+## 仓库内容
+
+| 文件 | 说明 |
+|---|---|
+| `test_abs_h2d_bandwidth.py` | 工具 1：`torch.abs` + `copy_` + pinned DMA 三条路径，免编译 |
+| `test_scatter_contig_vs_random.py` | 工具 2：scatter kernel 离散/连续对照（需编译） |
+| `test_h2d_contig_copy.py` | 工具 3：`VllmA5H2dContigCopy` 纯连续 DataCopyPad 搬运 kernel（需编译） |
+| `run_multidie.py` | 多 die 并发启动器：`--worker abs\|scatter\|contig`，逐配置计时屏障 + NUMA 绑核 |
+| `build_c8.sh` / `csrc/` / `torch_extension/` | 自定义算子（scatter + contig）构建脚手架 |
+
+通用口径：带宽 = 有效 payload ÷ 平均耗时，只计一次 H2D 方向；逐次迭代 NPU Event
+计时（保留 min/max/p50/p95/原始序列），wall clock 交叉校验；计时前后做字节级校验。
+
+## 快速开始
 
 ```bash
-ls /usr/local/Ascend/                                    # 默认安装位置
-env | grep -i ascend                                     # 之前配过环境的话直接在
-find /usr/local /home /opt -name "set_env.sh" -path "*Ascend*" 2>/dev/null
-```
-
-`ASCEND_HOME_PATH` 指向包含 `set_env.sh` 的目录，典型两种：
-`/usr/local/Ascend/cann`（合并安装/容器）或 `/usr/local/Ascend/ascend-toolkit/latest`
-（标准 toolkit 安装）。
-
-```bash
-export ASCEND_HOME_PATH=/usr/local/Ascend/cann   # 按上面找到的实际路径替换
+# 环境（ASCEND_HOME_PATH 指向含 set_env.sh 的目录）
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann   # 按实际路径替换
 source "$ASCEND_HOME_PATH/set_env.sh"
-# 验证环境：能打印版本号即 OK
 python3 -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__)"
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-# 默认全量：sizes 1..2048 MiB 对数 12 档 × fp16/bf16/fp32 × abs + copy 基线
-python3 test_abs_h2d_bandwidth.py \
-  --devices npu:0 \
-  --json-output results/abs_h2d_full_npu0.json
+# 工具 1：免编译，直接跑（含 DMA pinned_copy 基线）
+python3 test_abs_h2d_bandwidth.py --device npu:0 --sizes-mb 1024 2048 \
+  --dtypes fp16 --no-copy-baseline --json-output results/abs_npu0.json
+
+# 工具 2/3：先编译一次自定义算子
+export A5_SOC_VERSION=ascend950 NANOVLLM_A5_OPS_BUILD_JOBS=64
+bash build_c8.sh   # 通过标准：末尾 "[c8_build] torch extension import: OK"
+export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
+
+python3 test_h2d_contig_copy.py --device npu:0 --json-output results/contig_1die.json
+python3 test_scatter_contig_vs_random.py --device npu:0 --json-output results/scatter_ab_1die.json
 ```
 
-常用调节：
+## 多 die 并发
+
+`run_multidie.py` 每 die 一个进程同时跑，逐配置计时屏障对齐（所有 die 到齐才计时），
+可选 NUMA 绑核；聚合表输出各 die 带宽之和，明细在 `results/multidie_parts/`。
 
 ```bash
-# 多 die 顺序扫（每 die 独立全套数据）
-python3 test_abs_h2d_bandwidth.py --devices npu:0 npu:1 npu:2 npu:3 --json-output results/abs_h2d_cards4.json
+# 1:8：8 个 NPU 全在 CPU0
+python3 run_multidie.py --worker contig --devices 0 1 2 3 4 5 6 7 \
+  --numa-nodes 0 0 0 0 0 0 0 0 --json-output results/contig_8die_1to8.json
 
-# 只看大 payload 饱和段，加大迭代数
-python3 test_abs_h2d_bandwidth.py --sizes-mb 512 1024 2048 4096 8192 --iters 50
-
-# 只要 abs，不要 copy 基线
-python3 test_abs_h2d_bandwidth.py --no-copy-baseline
+# 1:4：两个 socket 各 4 个 NPU
+python3 run_multidie.py --worker contig --devices 0 2 4 6 8 10 12 14 \
+  --numa-nodes 0 0 0 0 1 1 1 1 --json-output results/contig_8die_1to4.json
 ```
 
-## 采集的数据
-
-每个 (device × op × dtype × size) 配置一行结果，包含：
-
-- `avg_us` / `bandwidth_gbps`：逐次迭代 Event 计时的均值及换算带宽。
-- `wall_us` / `wall_bandwidth_gbps`：wall clock 交叉校验口径（含 launch 间隙）。
-- `per_iter_us` / `bandwidth_per_iter_gbps`：min / max / mean / std / p50 / p95。
-- `raw_iter_us`：**每一次迭代的原始耗时**，全部保留在 JSON 里。
-- 环境信息：hostname、python/torch/torch_npu 版本、CANN 路径、`npu-smi info` 原文。
-- copy 基线：`out.copy_(host)` 同口径数据（`op=copy`），用于对比 swapped DRAM 的
-  拷贝路径，可用 `--no-copy-baseline` 关掉。
-- pinned 基线：`pin_memory=True` 锁页内存 → HBM 的 `copy_(non_blocking=True)`
-  （`op=pinned_copy`），走 DMA 拷贝引擎，是**全连续 H2D 的硬件上限探针**，
-  可用 `--no-pinned-baseline` 关掉。三种 op 对比可定位瓶颈：abs（计算 kernel 直读）
-  vs copy（swapped 拷贝路径）vs pinned_copy（DMA 引擎）。
-
-## 单卡与多卡
-
-默认只测 `--devices npu:0` **一个 die**。多 die 有两种测法：
-
-```bash
-# 顺序扫：每个 die 单独测（互不争抢，看单 die 最佳能力）
-python3 test_abs_h2d_bandwidth.py --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 npu:6 npu:7 \
-  --json-output results/abs_h2d_seq8.json
-
-# 并发测 8 卡：每 die 一个进程同时跑（共享 host DRAM/PCIe，与旧 8 卡绑核图同口径）
-python3 run_multidie.py --devices 0 1 2 3 4 5 6 7 \
-  --json-output results/abs_h2d_8die.json
-# 只测大 size 省时：参数放 -- 后面转发给单卡脚本
-python3 run_multidie.py -- --dtypes fp16 --sizes-mb 512 1024 2048 --iters 50
-```
-
-并发版输出每个 (op, dtype, size) 的 8 die 带宽**之和**（`sum_bw_gbps`），可直接和旧图
-240-260 GB/s 对比；每 die 的明细在 `results/multidie_parts/die*.json`，日志在同名 `.log`。
-
-注意与旧 8 卡图对比口径：旧图 240-260 GB/s 是 8 die 带宽之和，单 die 约 30 GB/s，
-和本测试单 die 的数值是同一量级。
-
-`--json-output` 同时生成同目录 `.csv` 汇总表（每配置一行，便于画图）。
-
-## 带宽口径
-
-`payload_bytes / avg_us / 1000`（GB/s），**只计一次有效 payload**
-（host→device 方向读取字节数），HBM 侧输出写入不重复计数。计时为逐次迭代
-NPU Event；swapped-memory 初始化（`fill_`/`add_` staging）不在计时区间。
-每档计时前会抽样校验结果与 CPU 参考逐字节一致（abs 校验 abs、copy 校验原值）。
-
-通过标志：每配置一行 `A5_ABS_H2D_RESULT ... ok=1`，结尾
-`A5_ABS_H2D_MAX_BANDWIDTH ... ok=1` 与 `A5_ABS_H2D_UT_OK`。
+NUMA 节点编号以 `lscpu | grep -i numa` 实际输出为准；机器没有 `numactl` 时去掉
+`--numa-nodes` 即可（不绑核）。`--` 后的参数原样转发给单卡脚本，例如
+`-- --sizes-mb 512 1024 2048 --iters 100`。
 
 ## 故障
 
-若报 `... with swapped-memory input and HBM output failed`，说明该 torch_npu
-版本不接受 swapped-memory 输入配 HBM 输出——请原样保留报错，需要换自定义 kernel
-方案（kernel 内直接读 host GM 地址）。
-
-## 备注
-
-- 主机内存占用约为每档 2×size（CPU 引用张量 + swapped 张量），8192 MiB 档约 16 GiB，
-  注意 host DRAM 余量。
-- 默认全套（3 dtype × 12 size × abs+copy）单 die 大约几分钟，主要花在 CPU 侧随机数初始化。
-
-## 工具 2：scatter 搬运 kernel 离散 vs 连续对照（需编译）
-
-回答的问题：**同一个搬运 kernel，离散访问和连续访问的 H2D 带宽差多少。**
-同一 `kvcache_scatter_copy_c8` kernel（656B 行、深度 8 MTE2 队列、QUEUE_DEPTH=8），
-只把元数据从随机（randperm block table / src / dst）换成连续（恒等 block table、
-顺序 src/dst），其余变量完全一致。
-
-```bash
-# 编译（一次即可；需要 CANN 环境的 msopgen）
-export ASCEND_HOME_PATH=/usr/local/Ascend/cann   # 按实际路径替换
-source "$ASCEND_HOME_PATH/set_env.sh"
-export A5_SOC_VERSION=ascend950 NANOVLLM_A5_OPS_BUILD_JOBS=64
-bash build_c8.sh
-# 通过标准：末尾打印 "[c8_build] torch extension import: OK"
-
-# 运行 A/B 对照（单 die；默认 copy_count 扫 300/2048/8192/16384，bs=24）
-export ASCEND_RT_VISIBLE_DEVICES=0
-export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
-python3 test_scatter_contig_vs_random.py \
-  --device npu:0 --json-output results/scatter_ab_npu0.json
-```
-
-输出每个 (pattern, copy_count) 一行 `A5_SCATTER_AB_RESULT`（含逐次迭代统计），
-结尾打印对照表：`copy_count / random_gbps / contig_gbps / contig/random` 比值。
-每个配置计时前后都做全量逐字节校验（poison 填充 + byte-exact 比较 +
-copy_count=0 不动 HBM 检查）。
-
-带宽口径与工具 1 相同：`copied_tokens × 656 / avg_us / 1000`（GB/s，只计一次有效
-payload）。注意：连续模式下每核按 `coreIdx + k×usedCoreNum` 交错取行，单核流是
-跨核交错的，整 die 视角才是全连续覆盖——这正是对照实验想要的（两模式只有地址
-模式不同）。
-
-### 八卡跑 scatter A/B 对照
-
-```bash
-# 先完成 build_c8.sh（只需一次），然后 8 die 并发：
-python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
-  --json-output results/scatter_ab_8die.json
-# 省时版：只测大 copy 档
-python3 run_multidie.py --worker scatter -- --copy-counts 2048 8192 16384 --iters 100
-```
-
-聚合表按 (pattern, copy_count) 输出 8 die 带宽之和，random 与 contiguous 两行直接
-可比；每 die 明细在 `results/multidie_parts/die*.json`。
-
-### NUMA 绑核（8 卡必看）
-
-不绑核时 8 个进程的 swapped DRAM 可能落在同一 NUMA 节点，跨 socket 流量会把聚合带宽
-压低近一半。先查拓扑再绑定（每个 die 一个节点，顺序与 --devices 对应）：
-
-```bash
-lscpu | grep -i numa                    # 看有几个 NUMA 节点
-npu-smi info -t topo -i 0               # 看 NPU 与 NUMA/PCIe 的亲和关系
-
-python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
-  --numa-nodes 0 0 1 1 2 2 3 3 \
-  --json-output results/scatter_ab_8die_numa.json
-```
-
-`--numa-nodes` 的值必须按本机实际拓扑填，上面只是示例。
-
-### 并发方法学（与旧 8 卡测试对齐）
-
-`run_multidie.py` 现在完整复刻旧 8 卡测试的方法学：
-
-1. **逐配置计时屏障**：每个 (pattern/size) 配置，所有 die 的 worker 到齐后由 launcher
-   统一放行，计时窗口严格重叠（日志里 `A5_H2D_MULTIDIE_BARRIER index=N released`），
-   避免初始化/校验耗时不同导致的"假并发"。
-2. **逐 die NUMA 绑核**：`--numa-nodes` 一个节点对应一个 die（见上节）。
-
-不带 `--numa-nodes` 时保持不绑核行为。单 die 直接跑 worker 脚本时屏障参数缺省，
-行为不变。
-
-## 工具 3：DataCopyPad 纯连续搬运 kernel（需编译）
-
-`VllmA5H2dContigCopy`：无元数据的极简搬运算子——每个 AIV 负责一段连续地址区间，
-以 16 KB DataCopyPad 大块、深度 4 MTE 队列从 host DRAM（swapped memory）流式搬到
-caller-owned HBM。测的是 **kernel 路径（非 DMA 引擎）全连续 H2D 的天花板**。
-
-```bash
-# 编译（与工具 2 同一次 build_c8.sh 即可，两个算子一起出）
-bash build_c8.sh
-
-# 单 die：默认 1 / 1024 / 2048 MiB 三档
-export ASCEND_RT_VISIBLE_DEVICES=0
-export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
-python3 test_h2d_contig_copy.py --device npu:0 \
-  --json-output results/contig_1die.json
-```
-
-### 8 卡两种拓扑（16 NPU 机：CPU0 带 NPU 0-7，CPU1 带 NPU 8-15）
-
-```bash
-# 1:8 —— 8 个 NPU 全挂在 CPU0（两颗 switch、一个 socket 的内存控制器）
-python3 run_multidie.py --worker contig --devices 0 1 2 3 4 5 6 7 \
-  --numa-nodes 0 0 0 0 0 0 0 0 \
-  --json-output results/contig_8die_1to8.json
-
-# 1:4 —— 每个 socket 各 4 个 NPU（四个 switch 上行、两个 socket 的内存控制器）
-python3 run_multidie.py --worker contig --devices 0 1 2 3 8 9 10 11 \
-  --numa-nodes 0 0 0 0 1 1 1 1 \
-  --json-output results/contig_8die_1to4.json
-```
-
-numa 节点编号以 `lscpu | grep -i numa` 实际输出为准（上面假设 node0=CPU0、node1=CPU1）。
-聚合表按 size_mb 输出 8 die 带宽之和；1:8 与 1:4 的差就是单 socket 内存/PCIe 上行
-瓶颈的代价。
+- 编译报错：确认 CANN 9.1+ 且已 `source set_env.sh`(`msopgen` 在 PATH 里）。
+- 运行报 `torch_npu.empty_with_swapped_memory is unavailable`：torch_npu 版本太旧。
+- 算子调用报错：确认 `PYTHONPATH` 指向本仓 `torch_extension` 且 `build_c8.sh` 成功。
