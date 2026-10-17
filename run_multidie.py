@@ -10,7 +10,7 @@ written under the results directory.
 Workers:
   abs     test_abs_h2d_bandwidth.py        (grouped by op/dtype/size_mb)
   scatter test_scatter_contig_vs_random.py (grouped by pattern/copy_count)
-  contig  test_h2d_contig_copy.py          (grouped by size_mb)
+  contig  test_h2d_contig_copy.py          (grouped by size_kb)
   scatter/contig require bash build_c8.sh first and use torch_extension via PYTHONPATH.
 """
 
@@ -42,7 +42,7 @@ WORKERS = {
     "contig": {
         "script": HERE / "test_h2d_contig_copy.py",
         "device_flag": "--device",
-        "group_keys": ("size_mb",),
+        "group_keys": ("size_kb",),
     },
 }
 

@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--copy-counts", type=int, nargs="+", default=DEFAULT_COPY_COUNTS,
                         help="Fixed tokens copied per request for each sweep point.")
+    parser.add_argument("--sizes-kb", type=int, nargs="+", default=None,
+                        help="Payload sizes in KiB per iteration; converted to per-request "
+                             "copy counts via round(kb*1024/(row_bytes*batch_size)) and "
+                             "overrides --copy-counts when set.")
     parser.add_argument("--source-len", type=int, default=65536)
     parser.add_argument("--hbm-slots", type=int, default=16384)
     parser.add_argument("--warmup", type=int, default=10)
@@ -61,14 +65,42 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be positive.")
     if not 1 <= args.source_len <= MAX_SOURCE_LEN:
         raise ValueError("--source-len must be in [1,262144].")
-    if not args.copy_counts:
-        raise ValueError("--copy-counts must be non-empty.")
-    cap = min(COPY_CAP, args.source_len, args.hbm_slots)
-    if any(count <= 0 or count > cap for count in args.copy_counts):
-        raise ValueError(f"each copy count must be in [1,{cap}] "
-                         "(min of copy-cap 16384, source-len, hbm-slots).")
+    if args.sizes_kb is not None:
+        if not args.sizes_kb or any(kb <= 0 for kb in args.sizes_kb):
+            raise ValueError("--sizes-kb must be a non-empty list of positive integers.")
+        resolve_sweep(args)
+    else:
+        if not args.copy_counts:
+            raise ValueError("--copy-counts must be non-empty.")
+        cap = min(COPY_CAP, args.source_len, args.hbm_slots)
+        if any(count <= 0 or count > cap for count in args.copy_counts):
+            raise ValueError(f"each copy count must be in [1,{cap}] "
+                             "(min of copy-cap 16384, source-len, hbm-slots).")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be non-negative and --iters positive.")
+
+
+def resolve_sweep(args: argparse.Namespace) -> list[tuple[int, int | None]]:
+    """Return the sweep as (copy_count, nominal_size_kb) pairs.
+
+    Without --sizes-kb the nominal size is None and rows are keyed by copy_count.
+    """
+    if args.sizes_kb is None:
+        return [(count, None) for count in args.copy_counts]
+    cap = min(COPY_CAP, args.source_len, args.hbm_slots)
+    bytes_per_request = ROW_BYTES * args.batch_size
+    sweep: list[tuple[int, int | None]] = []
+    seen: set[int] = set()
+    for kb in args.sizes_kb:
+        count = max(1, round(kb * 1024 / bytes_per_request))
+        if count > cap:
+            raise ValueError(f"--sizes-kb {kb} needs copy_count={count} > cap {cap}; "
+                             "raise --hbm-slots/--source-len or lower --batch-size.")
+        if count in seen:
+            continue
+        seen.add(count)
+        sweep.append((count, kb))
+    return sweep
 
 
 def require_a5(device: "torch.device", allow_non_a5: bool) -> str:
@@ -238,7 +270,7 @@ def timing_barrier(args: argparse.Namespace, index: int) -> None:
 
 
 def measure_config(args: argparse.Namespace, device: "torch.device", pattern: str,
-                   copy_count: int, barrier_index: int) -> dict:
+                   copy_count: int, barrier_index: int, nominal_kb: int | None = None) -> dict:
     case = make_case(args, device, pattern, copy_count)
     check_copy(case)
     for _ in range(args.warmup):
@@ -265,6 +297,7 @@ def measure_config(args: argparse.Namespace, device: "torch.device", pattern: st
     return {
         "pattern": pattern, "batch_size": args.batch_size, "copy_count": copy_count,
         "copied_tokens": copied_tokens, "payload_bytes": payload_bytes,
+        "size_kb": payload_bytes / 1024, "nominal_size_kb": nominal_kb,
         "warmup": args.warmup, "iters": args.iters,
         "avg_us": avg_us, "bandwidth_gbps": payload_bytes / (avg_us * 1000),
         "wall_us": wall_s * 1e6 / args.iters,
@@ -280,36 +313,42 @@ def run(args: argparse.Namespace) -> dict:
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
+    sweep = resolve_sweep(args)
+    sweep_desc = (
+        f"sizes_kb={args.sizes_kb} copy_counts={[count for count, _ in sweep]}"
+        if args.sizes_kb is not None else f"copy_counts={args.copy_counts}"
+    )
     print(
         f"A5_SCATTER_AB_CONFIG device={device} device_name={device_name!r} "
         f"batch={args.batch_size} source_len={args.source_len} hbm_slots={args.hbm_slots} "
-        f"copy_counts={args.copy_counts} warmup={args.warmup} iters={args.iters} "
+        f"{sweep_desc} warmup={args.warmup} iters={args.iters} "
         f"row_bytes={ROW_BYTES} queue_depth=8 opapi={vllm_dsa_a5.local_opapi_path()}",
         flush=True,
     )
     rows = []
     barrier_index = 0
-    for copy_count in args.copy_counts:
+    for copy_count, nominal_kb in sweep:
         for pattern in ("random", "contiguous"):
-            row = measure_config(args, device, pattern, copy_count, barrier_index)
+            row = measure_config(args, device, pattern, copy_count, barrier_index, nominal_kb)
             barrier_index += 1
             rows.append(row)
             bw = row["bandwidth_per_iter_gbps"]
             print(
                 f"A5_SCATTER_AB_RESULT pattern={pattern} copy_count={copy_count} "
+                f"size_kb={row['size_kb']:.1f} "
                 f"payload_bytes={row['payload_bytes']} avg_us={row['avg_us']:.3f} "
                 f"wall_us={row['wall_us']:.3f} bw_mean={bw['mean']:.3f} "
                 f"bw_min={bw['min']:.3f} bw_max={bw['max']:.3f} ok=1",
                 flush=True,
             )
-    print(f"\n{'copy_count':>10} {'random_gbps':>12} {'contig_gbps':>12} {'contig/random':>14}", flush=True)
+    print(f"\n{'copy_count':>10} {'size_kb':>10} {'random_gbps':>12} {'contig_gbps':>12} {'contig/random':>14}", flush=True)
     ratios = []
-    for copy_count in args.copy_counts:
+    for copy_count, _ in sweep:
         random_row = next(row for row in rows if row["pattern"] == "random" and row["copy_count"] == copy_count)
         contig_row = next(row for row in rows if row["pattern"] == "contiguous" and row["copy_count"] == copy_count)
         ratio = contig_row["bandwidth_gbps"] / random_row["bandwidth_gbps"]
         ratios.append(ratio)
-        print(f"{copy_count:>10} {random_row['bandwidth_gbps']:>12.3f} "
+        print(f"{copy_count:>10} {random_row['size_kb']:>10.1f} {random_row['bandwidth_gbps']:>12.3f} "
               f"{contig_row['bandwidth_gbps']:>12.3f} {ratio:>14.3f}", flush=True)
     result = {
         "schema_version": 1, "test": "a5_scatter_copy_random_vs_contiguous",
@@ -324,7 +363,8 @@ def run(args: argparse.Namespace) -> dict:
         "config": {
             "device": str(device), "batch_size": args.batch_size,
             "source_len": args.source_len, "hbm_slots": args.hbm_slots,
-            "copy_counts": args.copy_counts, "warmup": args.warmup, "iters": args.iters,
+            "copy_counts": [count for count, _ in sweep],
+            "sizes_kb": args.sizes_kb, "warmup": args.warmup, "iters": args.iters,
             "seed": args.seed, "row_bytes": ROW_BYTES, "queue_depth": 8,
             "bandwidth_convention": "copied payload counted once",
         },

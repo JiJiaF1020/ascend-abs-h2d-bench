@@ -16,6 +16,7 @@ host DRAM → HBM 搬运带宽测试集。三条路径可对比：
 | `test_scatter_contig_vs_random.py` | 工具 2：scatter kernel 离散/连续对照（需编译） |
 | `test_h2d_contig_copy.py` | 工具 3：`VllmA5H2dContigCopy` 纯连续 DataCopyPad 搬运 kernel（需编译） |
 | `run_multidie.py` | 多 die 并发启动器：`--worker abs\|scatter\|contig`，逐配置计时屏障对齐 |
+| `run_compare.py` | 一键对照：离散/连续 × 1:8/1:4 拓扑，尺寸 128K–8M，输出矩阵表 |
 | `build_c8.sh` / `csrc/` / `torch_extension/` | 自定义算子（scatter + contig）构建脚手架 |
 
 通用口径：带宽 = 有效 payload ÷ 平均耗时，只计一次 H2D 方向；逐次迭代 NPU Event
@@ -74,6 +75,22 @@ python3 run_multidie.py --worker contig --devices 0 2 4 6 8 10 12 14 \
 # `--` 后的参数原样转发给单卡脚本
 python3 run_multidie.py --worker contig -- --sizes-mb 512 1024 2048 --iters 100
 ```
+
+两个 kernel 脚本都支持 `--sizes-kb`(KiB 级尺寸；scatter 会按
+`round(kb*1024/(656*batch_size))` 折算成每请求 copy 条数）。
+
+## 一键对照：离散 vs 连续 × 1:8 vs 1:4
+
+```bash
+# 先完成上面的 build_c8.sh;默认尺寸 128 512 1024 2048 4096 8192 KiB
+python3 run_compare.py
+```
+
+依次跑 4 组 8 die 并发（scatter、contig 各 × 1:8、1:4 拓扑），输出一张矩阵：
+`rand_*` = scatter kernel 随机地址（离散）；`sc_contig_*` = 同一 scatter kernel
+连续地址（A/B 对照）;`contig_*` = 纯连续 DataCopyPad 搬算子。结果写到
+`results/compare/`(compare.md、compare.json 及每组明细）。可用
+`--sizes-kb`、`--devices-1to8`、`--devices-1to4`、`--iters` 等覆盖默认值。
 
 ## 故障
 

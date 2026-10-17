@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--sizes-mb", type=int, nargs="+", default=DEFAULT_SIZES_MB,
                         help="Payload sizes to sweep, in MiB per iteration.")
+    parser.add_argument("--sizes-kb", type=int, nargs="+", default=None,
+                        help="Payload sizes in KiB per iteration; overrides --sizes-mb when set.")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
@@ -48,8 +50,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not args.sizes_mb or any(size <= 0 for size in args.sizes_mb):
-        raise ValueError("--sizes-mb must be a non-empty list of positive integers.")
+    sizes_kb = args.sizes_kb if args.sizes_kb else [mb * 1024 for mb in args.sizes_mb]
+    if not sizes_kb or any(size <= 0 for size in sizes_kb):
+        raise ValueError("sizes must be a non-empty list of positive integers.")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be non-negative and --iters positive.")
 
@@ -134,8 +137,9 @@ def check_data(cpu: "torch.Tensor", dst: "torch.Tensor", seed: int) -> None:
 
 
 def measure_config(args: argparse.Namespace, device: "torch.device", device_name: str,
-                   size_mb: int, barrier_index: int) -> dict:
-    numel = size_mb * (1 << 20)
+                   size_bytes: int, barrier_index: int) -> dict:
+    numel = size_bytes
+    size_kb = size_bytes / 1024
     generator = torch.Generator().manual_seed(args.seed)
     cpu = torch.randint(-128, 128, (numel,), dtype=torch.int8, generator=generator)
     src = swapped_from_cpu(cpu, device)
@@ -148,7 +152,7 @@ def measure_config(args: argparse.Namespace, device: "torch.device", device_name
     call_op()
     torch.npu.synchronize()
     check_data(cpu, dst, args.seed)
-    print(f"A5_CONTIG_COPY_CHECK size_mb={size_mb} byte_exact=1 ok=1", flush=True)
+    print(f"A5_CONTIG_COPY_CHECK size_kb={size_kb:g} byte_exact=1 ok=1", flush=True)
 
     for _ in range(args.warmup):
         call_op()
@@ -172,7 +176,7 @@ def measure_config(args: argparse.Namespace, device: "torch.device", device_name
     torch.npu.empty_cache()
     return {
         "device": str(device), "device_name": device_name,
-        "size_mb": size_mb, "payload_bytes": payload_bytes,
+        "size_kb": size_kb, "nominal_size_kb": size_kb, "payload_bytes": payload_bytes,
         "warmup": args.warmup, "iters": args.iters,
         "avg_us": avg_us, "bandwidth_gbps": payload_bytes / (avg_us * 1000),
         "wall_us": wall_s * 1e6 / args.iters,
@@ -188,35 +192,37 @@ def run(args: argparse.Namespace) -> dict:
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
+    sizes_bytes = ([kb * 1024 for kb in args.sizes_kb] if args.sizes_kb
+                   else [mb * (1 << 20) for mb in args.sizes_mb])
     print(
         f"A5_CONTIG_COPY_CONFIG device={device} device_name={device_name!r} "
-        f"sizes_mb={args.sizes_mb} warmup={args.warmup} iters={args.iters} "
+        f"sizes_kb={[s // 1024 for s in sizes_bytes]} warmup={args.warmup} iters={args.iters} "
         "chunk_bytes=16384 queue_depth=4 "
         f"opapi={vllm_dsa_a5.local_opapi_path()}",
         flush=True,
     )
     rows = []
     barrier_index = 0
-    for size_mb in args.sizes_mb:
-        row = measure_config(args, device, device_name, size_mb, barrier_index)
+    for size_bytes in sizes_bytes:
+        row = measure_config(args, device, device_name, size_bytes, barrier_index)
         barrier_index += 1
         rows.append(row)
         bw = row["bandwidth_per_iter_gbps"]
         print(
-            f"A5_CONTIG_COPY_RESULT device={device} size_mb={size_mb} "
+            f"A5_CONTIG_COPY_RESULT device={device} size_kb={row['size_kb']:g} "
             f"payload_bytes={row['payload_bytes']} avg_us={row['avg_us']:.3f} "
             f"wall_us={row['wall_us']:.3f} bw_mean={bw['mean']:.3f} "
             f"bw_min={bw['min']:.3f} bw_max={bw['max']:.3f} ok=1",
             flush=True,
         )
     best = max(rows, key=lambda row: row["bandwidth_gbps"])
-    print(f"\n{'size_mb':>8} {'avg_us':>12} {'bw_mean':>9} {'bw_min':>9} {'bw_max':>9}", flush=True)
+    print(f"\n{'size_kb':>8} {'avg_us':>12} {'bw_mean':>9} {'bw_min':>9} {'bw_max':>9}", flush=True)
     for row in rows:
         bw = row["bandwidth_per_iter_gbps"]
-        print(f"{row['size_mb']:>8} {row['avg_us']:>12.3f} {bw['mean']:>9.3f} "
+        print(f"{row['size_kb']:>8g} {row['avg_us']:>12.3f} {bw['mean']:>9.3f} "
               f"{bw['min']:>9.3f} {bw['max']:>9.3f}", flush=True)
     print(
-        f"A5_CONTIG_COPY_MAX_BANDWIDTH device={device} size_mb={best['size_mb']} "
+        f"A5_CONTIG_COPY_MAX_BANDWIDTH device={device} size_kb={best['size_kb']:g} "
         f"bandwidth_gbps={best['bandwidth_gbps']:.3f} ok=1",
         flush=True,
     )
@@ -231,13 +237,14 @@ def run(args: argparse.Namespace) -> dict:
             "device_name": device_name, "npu_smi_info": npu_smi_info(),
         },
         "config": {
-            "device": str(device), "sizes_mb": args.sizes_mb, "warmup": args.warmup,
+            "device": str(device), "sizes_kb": [s // 1024 for s in sizes_bytes],
+            "warmup": args.warmup,
             "iters": args.iters, "seed": args.seed, "chunk_bytes": 16384,
             "queue_depth": 4, "allocator": "empty_with_swapped_memory",
             "access": "contiguous", "bandwidth_convention": "payload counted once",
         },
         "results": rows,
-        "max_bandwidth": {"size_mb": best["size_mb"], "bandwidth_gbps": best["bandwidth_gbps"]},
+        "max_bandwidth": {"size_kb": best["size_kb"], "bandwidth_gbps": best["bandwidth_gbps"]},
         "performance": {"timer": "npu_event_per_iteration", "cross_check": "wall_clock"},
     }
     if args.json_output is not None:
