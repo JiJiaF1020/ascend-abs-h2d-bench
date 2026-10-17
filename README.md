@@ -191,3 +191,38 @@ python3 run_multidie.py --worker scatter --devices 0 1 2 3 4 5 6 7 \
 
 不带 `--numa-nodes` 时保持不绑核行为。单 die 直接跑 worker 脚本时屏障参数缺省，
 行为不变。
+
+## 工具 3：DataCopyPad 纯连续搬运 kernel（需编译）
+
+`VllmA5H2dContigCopy`：无元数据的极简搬运算子——每个 AIV 负责一段连续地址区间，
+以 16 KB DataCopyPad 大块、深度 4 MTE 队列从 host DRAM（swapped memory）流式搬到
+caller-owned HBM。测的是 **kernel 路径（非 DMA 引擎）全连续 H2D 的天花板**。
+
+```bash
+# 编译（与工具 2 同一次 build_c8.sh 即可，两个算子一起出）
+bash build_c8.sh
+
+# 单 die：默认 1 / 1024 / 2048 MiB 三档
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
+python3 test_h2d_contig_copy.py --device npu:0 \
+  --json-output results/contig_1die.json
+```
+
+### 8 卡两种拓扑（16 NPU 机：CPU0 带 NPU 0-7，CPU1 带 NPU 8-15）
+
+```bash
+# 1:8 —— 8 个 NPU 全挂在 CPU0（两颗 switch、一个 socket 的内存控制器）
+python3 run_multidie.py --worker contig --devices 0 1 2 3 4 5 6 7 \
+  --numa-nodes 0 0 0 0 0 0 0 0 \
+  --json-output results/contig_8die_1to8.json
+
+# 1:4 —— 每个 socket 各 4 个 NPU（四个 switch 上行、两个 socket 的内存控制器）
+python3 run_multidie.py --worker contig --devices 0 1 2 3 8 9 10 11 \
+  --numa-nodes 0 0 0 0 1 1 1 1 \
+  --json-output results/contig_8die_1to4.json
+```
+
+numa 节点编号以 `lscpu | grep -i numa` 实际输出为准（上面假设 node0=CPU0、node1=CPU1）。
+聚合表按 size_mb 输出 8 die 带宽之和；1:8 与 1:4 的差就是单 socket 内存/PCIe 上行
+瓶颈的代价。

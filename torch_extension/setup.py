@@ -27,6 +27,7 @@ setup(
             sources=[
                 str(CSRC / "ops_registration.cpp"),
                 str(CSRC / "npu_kvcache_scatter_copy_c8.cpp"),
+                str(CSRC / "npu_h2d_contig_copy.cpp"),
                 str(CSRC / "op_api_common.cpp"),
             ],
             include_dirs=[str(CSRC)],

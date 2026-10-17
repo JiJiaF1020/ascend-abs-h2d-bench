@@ -8,6 +8,8 @@ TORCH_LIBRARY(vllm_dsa_a5, m) {
       "Tensor hbm_block_table, Tensor dram_block_table, "
       "Tensor source_token_ids, Tensor destination_slots, "
       "Tensor copy_counts) -> ()");
+  m.def(
+      "h2d_contig_copy(Tensor(a!) dst, Tensor src) -> ()");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

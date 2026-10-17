@@ -38,4 +38,8 @@ def kvcache_scatter_copy_c8(
     )
 
 
-__all__ = ["kvcache_scatter_copy_c8", "local_opapi_path"]
+def h2d_contig_copy(dst, src) -> None:
+    return torch.ops.vllm_dsa_a5.h2d_contig_copy(dst, src)
+
+
+__all__ = ["h2d_contig_copy", "kvcache_scatter_copy_c8", "local_opapi_path"]

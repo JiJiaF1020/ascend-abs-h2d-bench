@@ -87,5 +87,44 @@
             }
         ],
         "attr": []
+    },
+    {
+        "op": "VllmA5H2dContigCopy",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "dst",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int8"
+                ]
+            },
+            {
+                "name": "src",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int8"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "dst",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int8"
+                ]
+            }
+        ],
+        "attr": []
     }
 ]

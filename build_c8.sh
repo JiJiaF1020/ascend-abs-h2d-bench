@@ -25,8 +25,8 @@ command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
     exit 2
 }
 
-OP_NAMES=(VllmA5KvcacheScatterCopyC8)
-OP_DIRS=(kvcache_scatter_copy_c8)
+OP_NAMES=(VllmA5KvcacheScatterCopyC8 VllmA5H2dContigCopy)
+OP_DIRS=(kvcache_scatter_copy_c8 h2d_contig_copy)
 for op_dir in "${OP_DIRS[@]}"; do
     [[ -d "${SOURCE_ROOT}/${op_dir}" ]] || {
         echo "[c8_build] ERROR: missing ${SOURCE_ROOT}/${op_dir}." >&2
